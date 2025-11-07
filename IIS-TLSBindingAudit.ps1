@@ -4,7 +4,7 @@
   verify HOSTS file entries, optionally compare HTTP.SYS sslcerts, and export results.
 
 .PARAMETER Computer
-  Computer(s) or wildcard(s). Examples: 'localhost', 'WEB01', 'WEB*', 'web*-p?'
+  Computer(s) or wildcard(s). Examples: 'localhost', 'WEB01', 'WEB*', 'web-a*-APP?'
   Wildcards expand via ActiveDirectory if available (only Enabled machines are used).
 
 .PARAMETER SkipPing
@@ -27,6 +27,11 @@
 
 .NOTES
   Requires: PowerShell remoting enabled for remote Invoke-Command (WinRM).
+  Fixes / Enhancements:
+    - TLS validator uses in-scope $RevocationOnline (no $using: inside callback).
+    - HOSTS parsing tolerates tabs/multiple spaces and trailing dots.
+    - Optional HTTP.SYS compare (hash/store/appid) for quick mismatch triage.
+    - Strong validity gate: SAN/CN hostname match, EKU=ServerAuth, dates, key-strength, weak sig alg reject.
 #>
 
 [CmdletBinding()]
@@ -165,6 +170,17 @@ $functionBlock = {
             Issuer         = $null
             Protocol       = $null
             CipherSuite    = $null
+
+            # Deeper validity signals
+            HostnameOK     = $false
+            EkuServerAuth  = $false
+            SanPresent     = $false
+            KeyOK          = $false
+            SelfSigned     = $false
+            NotYetValid    = $false
+            Expired        = $false
+            WeakSigAlg     = $false
+            Valid          = $false
         }
 
         try {
@@ -188,24 +204,29 @@ $functionBlock = {
 
             $ns = $tcp.GetStream()
 
-            # IMPORTANT: use the *parameter* $RevocationOnline captured in this scope (no $using:)
+            # IMPORTANT: use parameter $RevocationOnline captured in this scope
             $ssl = New-Object System.Net.Security.SslStream($ns, $false, {
                 param($sender, [System.Security.Cryptography.X509Certificates.X509Certificate]$cert, $chain, $sslPolicyErrors)
                 $x509 = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 $cert
+
                 $ch = New-Object System.Security.Cryptography.X509Certificates.X509Chain
-                $ch.ChainPolicy.RevocationFlag = [System.Security.Cryptography.X509Certificates.X509RevocationFlag]::EntireChain
+                $ch.ChainPolicy.RevocationFlag    = [System.Security.Cryptography.X509Certificates.X509RevocationFlag]::EntireChain
                 $ch.ChainPolicy.VerificationFlags = [System.Security.Cryptography.X509Certificates.X509VerificationFlags]::NoFlag
                 $ch.ChainPolicy.UrlRetrievalTimeout = [TimeSpan]::FromSeconds(10)
-                $ch.ChainPolicy.RevocationMode = if ($RevocationOnline) {
+                $ch.ChainPolicy.RevocationMode    = if ($RevocationOnline) {
                     [System.Security.Cryptography.X509Certificates.X509RevocationMode]::Online
                 } else {
                     [System.Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
                 }
 
+                # Enforce EKU Server Authentication
+                $null = $ch.ChainPolicy.ApplicationPolicy.Add( (New-Object System.Security.Cryptography.Oid "1.3.6.1.5.5.7.3.1") )
+
                 $ok = $ch.Build($x509)
-                $script:lastChain = $ch
-                $script:lastLeaf  = $x509
+                $script:lastChain        = $ch
+                $script:lastLeaf         = $x509
                 $script:lastPolicyErrors = $sslPolicyErrors
+
                 return $ok -and ($sslPolicyErrors -eq [System.Net.Security.SslPolicyErrors]::None)
             })
 
@@ -218,23 +239,118 @@ $functionBlock = {
 
             $result.HandshakeOK = $true
 
-            $chainChecksPassed = ($script:lastPolicyErrors -eq [System.Net.Security.SslPolicyErrors]::None)
-            if ($script:lastChain -and $script:lastChain.ChainStatus.Count -gt 0) { $chainChecksPassed = $false }
-            $result.ChainOK = $chainChecksPassed
-
+            # --- Extra validations ---
             if ($script:lastLeaf) {
-                $result.LeafThumbprint = $script:lastLeaf.Thumbprint
-                $result.LeafSubject    = $script:lastLeaf.Subject
-                $result.LeafNotAfter   = $script:lastLeaf.NotAfter
+                $leaf = $script:lastLeaf
+                $result.LeafThumbprint = $leaf.Thumbprint
+                $result.LeafSubject    = $leaf.Subject
+                $result.LeafNotAfter   = $leaf.NotAfter
+
                 if ($script:lastChain -and $script:lastChain.ChainElements.Count -gt 1) {
                     $result.Issuer = $script:lastChain.ChainElements[1].Certificate.Subject
                 }
+
+                # Dates
+                $now = Get-Date
+                $result.NotYetValid = ($now -lt $leaf.NotBefore)
+                $result.Expired     = ($now -gt $leaf.NotAfter)
+
+                # Self-signed heuristic
+                $result.SelfSigned  = ($leaf.Subject -eq $leaf.Issuer) -and ($script:lastChain -and $script:lastChain.ChainElements.Count -eq 1)
+
+                # Weak signature algorithm (reject SHA1)
+                try {
+                    $sigName = $leaf.SignatureAlgorithm.FriendlyName
+                    if ($sigName -match 'sha1') { $result.WeakSigAlg = $true }
+                } catch {}
+
+                # SAN presence + hostname coverage
+                $sanDns = @()
+                try {
+                    $sanExt = $leaf.Extensions | Where-Object { $_.Oid.Value -eq '2.5.29.17' } | Select-Object -First 1
+                    if ($sanExt) {
+                        $sanText = $sanExt.Format($true) # "DNS Name=foo"
+                        $sanDns  = ($sanText -split '[\r\n,]') | ForEach-Object {
+                            ($_ -replace '^\s*DNS Name\s*=\s*','').Trim()
+                        } | Where-Object { $_ -and ($_ -notmatch '^\s*$') }
+                        if ($sanDns.Count -gt 0) { $result.SanPresent = $true }
+                    }
+                } catch {}
+
+                # HostnameOK (prefer SAN; CN fallback)
+                $target = $TargetHost.ToLower()
+                $hostnameMatches = $false
+                if ($sanDns.Count -gt 0) {
+                    foreach ($d in $sanDns) {
+                        $pat = '^' + [regex]::Escape($d.ToLower()).Replace('\*','.*') + '$'
+                        if ($target -match $pat) { $hostnameMatches = $true; break }
+                    }
+                } else {
+                    try {
+                        $cn = ($leaf.Subject -split ',') | Where-Object { $_ -match 'CN\s*=' } | Select-Object -First 1
+                        $cn = ($cn -replace '.*CN\s*=\s*','').Trim().ToLower()
+                        if ($cn) {
+                            $pat = '^' + [regex]::Escape($cn).Replace('\*','.*') + '$'
+                            if ($target -match $pat) { $hostnameMatches = $true }
+                        }
+                    } catch {}
+                }
+                $result.HostnameOK = $hostnameMatches
+
+                # EKU ServerAuth (double-check in leaf)
+                $ekuOk = $false
+                try {
+                    $ekuExt = $leaf.Extensions | Where-Object { $_.Oid.FriendlyName -eq 'Enhanced Key Usage' } | Select-Object -First 1
+                    if ($ekuExt) {
+                        $ekuText = $ekuExt.Format($true)
+                        if ($ekuText -match '(Server Authentication|1\.3\.6\.1\.5\.5\.7\.3\.1)') { $ekuOk = $true }
+                    } else {
+                        $ekuOk = $false
+                    }
+                } catch {}
+                $result.EkuServerAuth = $ekuOk
+
+                # Key strength
+                $keyOK = $false
+                try {
+                    $rsa   = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPublicKey($leaf)
+                    $ecdsa = [System.Security.Cryptography.X509Certificates.ECDsaCertificateExtensions]::GetECDsaPublicKey($leaf)
+                    if ($rsa) {
+                        if ($rsa.KeySize -ge 2048) { $keyOK = $true }
+                        $rsa.Dispose()
+                    } elseif ($ecdsa) {
+                        # Curve presence is enough (e.g., P-256/384/521)
+                        $keyOK = $true
+                        $ecdsa.Dispose()
+                    }
+                } catch {}
+                $result.KeyOK = $keyOK
             }
 
-            try {
-                $result.Protocol    = $ssl.SslProtocol.ToString()
-                $result.CipherSuite = $ssl.NegotiatedCipherSuite.ToString()
-            } catch {}
+            # Preserve platform signals
+            $chainOK = ($script:lastPolicyErrors -eq [System.Net.Security.SslPolicyErrors]::None)
+            if ($script:lastChain -and $script:lastChain.ChainStatus.Count -gt 0) { $chainOK = $false }
+            $result.ChainOK = $chainOK
+
+            # Final validity gate
+            $result.Valid = ($result.HandshakeOK -and
+                             $result.ChainOK     -and
+                             -not $result.NotYetValid -and
+                             -not $result.Expired     -and
+                             $result.HostnameOK       -and
+                             $result.EkuServerAuth    -and
+                             $result.KeyOK            -and
+                             -not $result.WeakSigAlg)
+
+            if (-not $result.Valid) {
+                if (-not $result.HostnameOK) { $result.Errors += 'Name: Hostname does not match SAN/CN.' }
+                if (-not $result.EkuServerAuth) { $result.Errors += 'EKU: Missing Server Authentication.' }
+                if (-not $result.KeyOK) { $result.Errors += 'Key: RSA<2048 or ECDSA missing.' }
+                if ($result.NotYetValid) { $result.Errors += 'Date: Not yet valid.' }
+                if ($result.Expired) { $result.Errors += 'Date: Expired.' }
+                if ($result.WeakSigAlg) { $result.Errors += 'SigAlg: SHA-1 not allowed.' }
+                if ($result.SelfSigned) { $result.Errors += 'Trust: Self-signed.' }
+            }
 
             $ssl.Dispose()
             $tcp.Close()
@@ -294,8 +410,8 @@ $functionBlock = {
 
     # ---- HTTP.SYS PARSE (optional) ----
     $httpSys = @{
-        ipport      = @{}
-        hostnameport= @{}
+        ipport       = @{}
+        hostnameport = @{}
     }
 
     if ($IncludeHttpSys) {
@@ -397,10 +513,20 @@ $functionBlock = {
                     SNI           = $SniEnabled
                     HostsEntry    = $hostsCheckResult.Present
                     HostsEntryIP  = $hostsCheckResult.IP
+                    # Validity columns not applicable when skipped:
+                    HostnameOK    = $null
+                    EkuServerAuth = $null
+                    SanPresent    = $null
+                    KeyOK         = $null
+                    NotYetValid   = $null
+                    Expired       = $null
+                    WeakSigAlg    = $null
+                    SelfSigned    = $null
+                    # HTTP.SYS
                     HttpSysHash   = $httpSysHashShort
                     HttpSysStore  = $httpSysStore
                     HttpSysAppId  = $httpSysAppId
-                    HttpSysMatch  = $false  # cannot assert without TLS result/cert
+                    HttpSysMatch  = $false  # no TLS, cannot assert
                 }
                 continue
             }
@@ -422,8 +548,8 @@ $functionBlock = {
                 Thumbprint    = if ($cert) { ShortThumbprint $cert.Thumbprint } else { ShortThumbprint $tlsTestResult.LeafThumbprint }
                 Store         = $binding.certificateStoreName
                 Expiration    = if ($cert) { $cert.NotAfter } else { $tlsTestResult.LeafNotAfter }
-                TestStatus    = if ($tlsTestResult.HandshakeOK -and $tlsTestResult.ChainOK) { "OK" } else { "FAIL" }
-                SslOK         = ($tlsTestResult.HandshakeOK -and $tlsTestResult.ChainOK)
+                TestStatus    = if ($tlsTestResult.Valid) { "OK" } else { "FAIL" }
+                SslOK         = $tlsTestResult.Valid
                 Errors        = if ($tlsTestResult.Errors) { ($tlsTestResult.Errors -join " || ") } else { "" }
                 RemoteIP      = $tlsTestResult.RemoteIP
                 Protocol      = $tlsTestResult.Protocol
@@ -431,6 +557,16 @@ $functionBlock = {
                 SNI           = $SniEnabled
                 HostsEntry    = $hostsCheckResult.Present
                 HostsEntryIP  = $hostsCheckResult.IP
+                # Validity diagnostics
+                HostnameOK    = $tlsTestResult.HostnameOK
+                EkuServerAuth = $tlsTestResult.EkuServerAuth
+                SanPresent    = $tlsTestResult.SanPresent
+                KeyOK         = $tlsTestResult.KeyOK
+                NotYetValid   = $tlsTestResult.NotYetValid
+                Expired       = $tlsTestResult.Expired
+                WeakSigAlg    = $tlsTestResult.WeakSigAlg
+                SelfSigned    = $tlsTestResult.SelfSigned
+                # HTTP.SYS compare
                 HttpSysHash   = $httpSysHashShort
                 HttpSysStore  = $httpSysStore
                 HttpSysAppId  = $httpSysAppId
@@ -477,6 +613,14 @@ foreach ($comp in $targets) {
             Errors       = "Invoke-Command: $errMsg"
             HostsEntry   = $null
             HostsEntryIP = $null
+            HostnameOK   = $null
+            EkuServerAuth= $null
+            SanPresent   = $null
+            KeyOK        = $null
+            NotYetValid  = $null
+            Expired      = $null
+            WeakSigAlg   = $null
+            SelfSigned   = $null
             HttpSysHash  = $null
             HttpSysStore = $null
             HttpSysAppId = $null
@@ -501,7 +645,10 @@ foreach ($comp in $targets) {
 $allResults = $allResults | Sort-Object { $_.SslOK -eq $false }, Computer, SiteName, HostName
 
 $allResults | Format-Table `
-    Computer, ComputerIP, PingOK, SiteName, HostName, BindingIP, Port, Thumbprint, Expiration, TestStatus, SslOK, SNI, Protocol, CipherSuite, HostsEntry, HostsEntryIP, HttpSysHash, HttpSysMatch, Errors -AutoSize
+    Computer, ComputerIP, PingOK, SiteName, HostName, BindingIP, Port, Thumbprint, Expiration, TestStatus, SslOK, `
+    SNI, Protocol, CipherSuite, HostsEntry, HostsEntryIP, `
+    HostnameOK, EkuServerAuth, SanPresent, KeyOK, NotYetValid, Expired, WeakSigAlg, SelfSigned, `
+    HttpSysHash, HttpSysMatch, Errors -AutoSize
 
 # ----------------------- Export -----------------------
 if ($Export) {
