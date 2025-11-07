@@ -49,13 +49,8 @@ IIS WebAdministration module available
 Sufficient permissions to query certificates and IIS configuration
 
 Example Usage
-# Scan local IIS bindings
 .\iis-tls-audit.ps1
-
-# Scan remote IIS servers and export full report
 .\iis-tls-audit.ps1 -Computer "WEB01","WEB02" -IncludeHttpSys -Export "C:\Logs\IIS-TLS-Report.csv"
-
-# Scan AD-enabled wildcard servers and only export failed checks
 .\iis-tls-audit.ps1 -Computer "WEB-*" -RevocationOnline -FailsOnly -Export "C:\Logs\TLS-Fails.csv"
 
 Output Highlights
@@ -68,15 +63,3 @@ SNI, Protocol, CipherSuite
 Hostname, SAN, EKU, Key Strength
 HTTP.SYS Match State
 Error Summary
-
-Sample output
-
->>> Scanning IIS certificates on WEB01 ...
->>> Scanning IIS certificates on WEB02 ...
-
-Computer  ComputerIP    PingOK SiteName    HostName           BindingIP Port Thumb Expiration           TestStatus SslOK SNI Protocol CipherSuite      HostsEntry HostsEntryIP  HostnameOK EKU KeyOK Expired WeakSigAlg SelfSigned HttpSysMatch Errors
---------- ------------- ------ ----------- ------------------ ---------- ---- ----- ------------------- ----------- ----- --- -------- ---------------- ----------- ------------- ---------- --- ------ ------- ---------- ----------- ---------------
-WEB01     10.0.1.15     True   DefaultWeb  api.company.com    *          443  89FAD 2026-03-14 09:12:00 OK          True  Yes TLS 1.3  TLS_AES_256_GCM_SHA384 True        10.0.1.15     True       True True   False   False      False       True
-WEB01     10.0.1.15     True   AppPortal   portal.company.com *          443  32A7C 2025-08-02 22:00:00 FAIL        False Yes TLS 1.2  TLS_ECDHE              True        10.0.1.15     False      True True   False   False      False       False       Name: Hostname does not match SAN/CN.
-WEB02     10.0.1.16     True   Reports     reports.company.com *         443  45BC9 2026-11-19 10:00:00 OK          True  Yes TLS 1.3  TLS_AES_256_GCM_SHA384 True        10.0.1.16     True       True True   False   False      False       True
-WEB02     10.0.1.16     True   LegacyApp   (none)             *          443  9F3B1 -                   Skipped     False No  -          -                    False       -             -          -    -      -       -          -           -        No hostname in binding (SNI not possible)
