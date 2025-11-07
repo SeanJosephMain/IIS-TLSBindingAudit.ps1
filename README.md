@@ -50,8 +50,11 @@ Sufficient permissions to query certificates and IIS configuration
 
 Example Usage
 .\iis-tls-audit.ps1
+
 .\iis-tls-audit.ps1 -Computer "WEB01","WEB02" -IncludeHttpSys -Export "C:\Logs\IIS-TLS-Report.csv"
+
 .\iis-tls-audit.ps1 -Computer "WEB-*" -RevocationOnline -FailsOnly -Export "C:\Logs\TLS-Fails.csv"
+
 
 Output Highlights
 
